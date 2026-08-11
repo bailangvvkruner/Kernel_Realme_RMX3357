@@ -39,12 +39,16 @@ jobs:
 
     steps:
       - name: Check out selected branch
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.branch || github.ref_name }}
-          fetch-depth: 1
-          persist-credentials: false
-          submodules: false
+        shell: bash
+        env:
+          REQUESTED_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.branch || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          git init -q "$GITHUB_WORKSPACE"
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git fetch --no-tags --depth=1 origin "refs/heads/$REQUESTED_REF"
+          git -c advice.detachedHead=false checkout --detach FETCH_HEAD
 
       - name: Resolve source metadata
         id: source
@@ -156,10 +160,14 @@ jobs:
 
           toolchains="$RUNNER_TEMP/rmx3357-toolchains"
           test -x "$toolchains/clang/bin/clang"
+          test -x "$toolchains/clang/bin/ld.lld"
+          test -x "$toolchains/clang/bin/llvm-nm"
+          test -x "$toolchains/clang/bin/llvm-objcopy"
           test -x "$toolchains/gcc64/bin/aarch64-linux-androidkernel-gcc"
           test -x "$toolchains/gcc32/bin/arm-linux-androideabi-gcc"
 
           "$toolchains/clang/bin/clang" --version
+          "$toolchains/clang/bin/ld.lld" --version | head -n 1
           "$toolchains/gcc64/bin/aarch64-linux-androidkernel-gcc" --version | head -n 1
           "$toolchains/gcc32/bin/arm-linux-androideabi-gcc" --version | head -n 1
 
@@ -194,18 +202,78 @@ jobs:
             "CROSS_COMPILE=$toolchains/gcc64/bin/aarch64-linux-androidkernel-"
             "CROSS_COMPILE_ARM32=$toolchains/gcc32/bin/arm-linux-androideabi-"
             "CLANG_TRIPLE=aarch64-linux-gnu-"
+            "LD=ld.lld"
+            "NM=llvm-nm"
+            "OBJCOPY=llvm-objcopy"
           )
 
-          make -j"$(nproc)" "${common_args[@]}" CC=clang "$DEFCONFIG"
-          make -j"$(nproc)" "${common_args[@]}" CC="ccache clang" 2>&1 | tee build.log
+          : > build.log
+          {
+            echo "Source: $(git rev-parse HEAD)"
+            echo "Defconfig: $DEFCONFIG"
+            clang --version
+            ld.lld --version | head -n 1
+          } | tee -a build.log
 
-          test -s "$KERNEL_IMAGE"
+          set +e
+          make -j"$(nproc)" "${common_args[@]}" CC=clang "$DEFCONFIG" \
+            2>&1 | tee -a build.log
+          build_status="${PIPESTATUS[0]}"
+
+          if [[ "$build_status" -eq 0 ]]; then
+            make -j"$(nproc)" "${common_args[@]}" CC="ccache clang" \
+              2>&1 | tee -a build.log
+            build_status="${PIPESTATUS[0]}"
+          fi
+          set -e
+
+          if [[ "$build_status" -eq 0 ]] && [[ ! -s "$KERNEL_IMAGE" ]]; then
+            echo "error: expected kernel image was not generated: $KERNEL_IMAGE" \
+              | tee -a build.log
+            build_status=1
+          fi
+
+          ccache --show-stats | tee -a build.log || true
+
+          if [[ "$build_status" -ne 0 ]]; then
+            {
+              echo "## Kernel build failed"
+              echo
+              echo "### Compiler errors"
+              echo '```text'
+              grep -E \
+                '(^|[[:space:]])(fatal error:|error:|undefined reference|No rule to make target|Error [0-9]+)' \
+                build.log | tail -n 80 || true
+              echo '```'
+              echo
+              echo '<details><summary>Last 160 log lines</summary>'
+              echo
+              echo '```text'
+              tail -n 160 build.log
+              echo '```'
+              echo '</details>'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            exit "$build_status"
+          fi
+
           file "$KERNEL_IMAGE"
-          ccache --show-stats
 
           kernel_release="$(make -s "${common_args[@]}" CC=clang kernelrelease)"
           echo "kernel_release=$kernel_release" >> "$GITHUB_OUTPUT"
           echo "Built kernel release: $kernel_release"
+
+      - name: Upload failed build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RMX3357-build-failure-${{ steps.source.outputs.ref_slug }}-r${{ github.run_number }}a${{ github.run_attempt }}
+          path: |
+            build.log
+            out/.config
+            out/include/generated/autoconf.h
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Generate Beijing release metadata
         id: release
