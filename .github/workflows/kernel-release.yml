@@ -1,0 +1,336 @@
+name: Build and release RMX3357 kernel
+
+on:
+  push:
+    branches:
+      - kernel-4.14
+      - 4.14-rsu
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to build
+        required: true
+        default: 4.14-rsu
+        type: choice
+        options:
+          - 4.14-rsu
+          - kernel-4.14
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ github.event_name == 'workflow_dispatch' && inputs.branch || github.ref_name }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    env:
+      ARCH: arm64
+      DEFCONFIG: vendor/full/Neo2t_defconfig
+      KERNEL_IMAGE: out/arch/arm64/boot/Image.gz-dtb
+      CLANG_URL: https://github.com/ZyCromerZ/Clang/releases/download/11.1.0-20220724-release/Clang-11.1.0-20220724.tar.gz
+      CLANG_ID: 11.1.0-20220724
+      GCC64_REPO: LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9
+      GCC64_COMMIT: be79a1c2ee1ff7a110b653a682c236979539acd2
+      GCC32_REPO: LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9
+      GCC32_COMMIT: da10d2bd65e2c57d338fb6bb712ff522ad4e34e7
+      RESUKISU_REPO: https://github.com/ReSukiSU/ReSukiSU.git
+
+    steps:
+      - name: Check out selected branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.branch || github.ref_name }}
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Resolve source metadata
+        id: source
+        shell: bash
+        env:
+          REQUESTED_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.branch || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          build_sha="$(git rev-parse HEAD)"
+          short_sha="$(git rev-parse --short=12 HEAD)"
+          ref_slug="$(printf '%s' "$REQUESTED_REF" | sed 's/[^A-Za-z0-9._-]/-/g')"
+
+          test -n "$ref_slug"
+          echo "ref=$REQUESTED_REF" >> "$GITHUB_OUTPUT"
+          echo "ref_slug=$ref_slug" >> "$GITHUB_OUTPUT"
+          echo "sha=$build_sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
+
+          git show --no-patch --format='Building %H%nCommit: %s%nAuthor: %an <%ae>' HEAD
+
+      - name: Restore pinned ReSukiSU source
+        id: ksu
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mode="none"
+          commit="none"
+          gitlink="$(git ls-files -s KernelSU | awk '$1 == 160000 { print $2 }')"
+
+          if [[ -n "$gitlink" ]]; then
+            mode="ReSukiSU"
+            commit="$gitlink"
+            rm -rf -- KernelSU
+            git init -q KernelSU
+            git -C KernelSU remote add origin "$RESUKISU_REPO"
+            git -C KernelSU fetch --filter=blob:none origin "$gitlink"
+            git -C KernelSU -c advice.detachedHead=false checkout FETCH_HEAD
+
+            test -f KernelSU/kernel/Kconfig
+            test -L drivers/kernelsu
+            test -f drivers/kernelsu/Kconfig
+            test -f drivers/kernelsu/Kbuild
+          fi
+
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "KernelSU mode: $mode"
+          echo "KernelSU commit: $commit"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            bc \
+            bison \
+            build-essential \
+            ccache \
+            flex \
+            libelf-dev \
+            libncurses-dev \
+            libssl-dev \
+            libtinfo5 \
+            lz4 \
+            python3 \
+            rsync \
+            zip
+
+      - name: Restore toolchain cache
+        id: toolchain-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rmx3357-toolchains
+          key: rmx3357-toolchains-${{ env.CLANG_ID }}-${{ env.GCC64_COMMIT }}-${{ env.GCC32_COMMIT }}
+
+      - name: Download pinned toolchains
+        if: steps.toolchain-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          toolchains="$RUNNER_TEMP/rmx3357-toolchains"
+          mkdir -p "$toolchains/clang" "$toolchains/gcc64" "$toolchains/gcc32"
+
+          download() {
+            curl \
+              --fail \
+              --location \
+              --retry 5 \
+              --retry-all-errors \
+              --retry-delay 5 \
+              --connect-timeout 30 \
+              "$1"
+          }
+
+          download "$CLANG_URL" | tar -xz -C "$toolchains/clang"
+          download "https://github.com/$GCC64_REPO/archive/$GCC64_COMMIT.tar.gz" \
+            | tar -xz --strip-components=1 -C "$toolchains/gcc64"
+          download "https://github.com/$GCC32_REPO/archive/$GCC32_COMMIT.tar.gz" \
+            | tar -xz --strip-components=1 -C "$toolchains/gcc32"
+
+      - name: Verify toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          toolchains="$RUNNER_TEMP/rmx3357-toolchains"
+          test -x "$toolchains/clang/bin/clang"
+          test -x "$toolchains/gcc64/bin/aarch64-linux-androidkernel-gcc"
+          test -x "$toolchains/gcc32/bin/arm-linux-androideabi-gcc"
+
+          "$toolchains/clang/bin/clang" --version
+          "$toolchains/gcc64/bin/aarch64-linux-androidkernel-gcc" --version | head -n 1
+          "$toolchains/gcc32/bin/arm-linux-androideabi-gcc" --version | head -n 1
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: rmx3357-ccache-${{ runner.os }}-${{ steps.source.outputs.ref_slug }}-${{ hashFiles('arch/arm64/configs/vendor/full/Neo2t_defconfig') }}
+          restore-keys: |
+            rmx3357-ccache-${{ runner.os }}-${{ steps.source.outputs.ref_slug }}-
+            rmx3357-ccache-${{ runner.os }}-
+
+      - name: Build kernel
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          toolchains="$RUNNER_TEMP/rmx3357-toolchains"
+          export PATH="$toolchains/clang/bin:$PATH"
+          export KBUILD_BUILD_USER="github-actions"
+          export KBUILD_BUILD_HOST="github"
+          export CCACHE_DIR="$HOME/.cache/ccache"
+          export CCACHE_COMPILERCHECK=content
+
+          ccache --max-size=2G
+          ccache --zero-stats
+
+          common_args=(
+            "O=$GITHUB_WORKSPACE/out"
+            "ARCH=$ARCH"
+            "CROSS_COMPILE=$toolchains/gcc64/bin/aarch64-linux-androidkernel-"
+            "CROSS_COMPILE_ARM32=$toolchains/gcc32/bin/arm-linux-androideabi-"
+            "CLANG_TRIPLE=aarch64-linux-gnu-"
+          )
+
+          make -j"$(nproc)" "${common_args[@]}" CC=clang "$DEFCONFIG"
+          make -j"$(nproc)" "${common_args[@]}" CC="ccache clang" 2>&1 | tee build.log
+
+          test -s "$KERNEL_IMAGE"
+          file "$KERNEL_IMAGE"
+          ccache --show-stats
+
+          kernel_release="$(make -s "${common_args[@]}" CC=clang kernelrelease)"
+          echo "kernel_release=$kernel_release" >> "$GITHUB_OUTPUT"
+          echo "Built kernel release: $kernel_release"
+
+      - name: Generate Beijing release metadata
+        id: release
+        shell: bash
+        env:
+          REF_SLUG: ${{ steps.source.outputs.ref_slug }}
+        run: |
+          set -euo pipefail
+
+          bjt_compact="$(TZ=Asia/Shanghai date '+%Y%m%d-%H%M%S')"
+          bjt_display="$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
+          tag="rmx3357-${REF_SLUG}-${bjt_compact}-r${GITHUB_RUN_NUMBER}a${GITHUB_RUN_ATTEMPT}"
+          package="RMX3357-${REF_SLUG}-${bjt_compact}.zip"
+
+          echo "bjt_compact=$bjt_compact" >> "$GITHUB_OUTPUT"
+          echo "bjt_display=$bjt_display" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "package=$package" >> "$GITHUB_OUTPUT"
+
+      - name: Package build outputs
+        shell: bash
+        env:
+          BUILD_REF: ${{ steps.source.outputs.ref }}
+          BUILD_SHA: ${{ steps.source.outputs.sha }}
+          SHORT_SHA: ${{ steps.source.outputs.short_sha }}
+          KERNEL_RELEASE: ${{ steps.build.outputs.kernel_release }}
+          KSU_MODE: ${{ steps.ksu.outputs.mode }}
+          KSU_COMMIT: ${{ steps.ksu.outputs.commit }}
+          BJT_DISPLAY: ${{ steps.release.outputs.bjt_display }}
+          PACKAGE_NAME: ${{ steps.release.outputs.package }}
+        run: |
+          set -euo pipefail
+
+          dist="$GITHUB_WORKSPACE/dist"
+          package_dir="$dist/package"
+          mkdir -p "$package_dir/modules"
+
+          cp "$KERNEL_IMAGE" "$dist/Image.gz-dtb"
+          cp "$KERNEL_IMAGE" "$package_dir/Image.gz-dtb"
+          cp out/.config "$package_dir/kernel.config"
+          cp out/System.map "$package_dir/System.map"
+          cp build.log "$package_dir/build.log"
+
+          [[ ! -s out/arch/arm64/boot/Image.gz ]] || cp out/arch/arm64/boot/Image.gz "$package_dir/Image.gz"
+          [[ ! -s out/arch/arm64/boot/Image ]] || cp out/arch/arm64/boot/Image "$package_dir/Image"
+
+          while IFS= read -r -d '' module; do
+            relative="${module#out/}"
+            mkdir -p "$package_dir/modules/$(dirname "$relative")"
+            cp "$module" "$package_dir/modules/$relative"
+          done < <(find out -type f -name '*.ko' -print0)
+
+          cat > "$package_dir/BUILD_INFO.txt" <<EOF
+          Device: realme GT Neo2T (RMX3357)
+          Source ref: $BUILD_REF
+          Source commit: $BUILD_SHA
+          Kernel release: $KERNEL_RELEASE
+          KernelSU mode: $KSU_MODE
+          KernelSU commit: $KSU_COMMIT
+          Release time: $BJT_DISPLAY (Asia/Shanghai, UTC+8)
+          Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          Image.gz-dtb is a raw kernel image, not a boot.img or a flashable ZIP.
+          Repack it into the matching RMX3357 boot image before flashing.
+          EOF
+
+          (
+            cd "$package_dir"
+            find . -type f ! -name SHA256SUMS.txt -print0 \
+              | sort -z \
+              | xargs -0 sha256sum > SHA256SUMS.txt
+            zip -9 -r "$dist/$PACKAGE_NAME" .
+          )
+
+          sha256sum "$dist/Image.gz-dtb" "$dist/$PACKAGE_NAME" > "$dist/SHA256SUMS.txt"
+          cp build.log "$dist/build.log"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RMX3357-${{ steps.source.outputs.ref_slug }}-${{ steps.release.outputs.bjt_compact }}
+          path: |
+            dist/${{ steps.release.outputs.package }}
+            dist/Image.gz-dtb
+            dist/SHA256SUMS.txt
+            dist/build.log
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_REF: ${{ steps.source.outputs.ref }}
+          BUILD_SHA: ${{ steps.source.outputs.sha }}
+          SHORT_SHA: ${{ steps.source.outputs.short_sha }}
+          KERNEL_RELEASE: ${{ steps.build.outputs.kernel_release }}
+          KSU_MODE: ${{ steps.ksu.outputs.mode }}
+          KSU_COMMIT: ${{ steps.ksu.outputs.commit }}
+          BJT_DISPLAY: ${{ steps.release.outputs.bjt_display }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          PACKAGE_NAME: ${{ steps.release.outputs.package }}
+        run: |
+          set -euo pipefail
+
+          cat > release-notes.md <<EOF
+          Automated RMX3357 kernel build.
+
+          - Source branch: \`$BUILD_REF\`
+          - Source commit: \`$BUILD_SHA\`
+          - Kernel release: \`$KERNEL_RELEASE\`
+          - KernelSU mode: \`$KSU_MODE\`
+          - KernelSU commit: \`$KSU_COMMIT\`
+          - Release time: $BJT_DISPLAY (Beijing time, UTC+8)
+          - Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          The attached \`Image.gz-dtb\` is a raw kernel image. It is not a boot image and must not be flashed directly to the boot partition.
+          EOF
+
+          gh release create "$RELEASE_TAG" \
+            "dist/$PACKAGE_NAME" \
+            "dist/Image.gz-dtb" \
+            "dist/SHA256SUMS.txt" \
+            "dist/build.log" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$BUILD_SHA" \
+            --title "RMX3357 $BUILD_REF - $BJT_DISPLAY Beijing time" \
+            --notes-file release-notes.md
